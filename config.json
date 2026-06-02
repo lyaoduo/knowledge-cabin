@@ -1,0 +1,40 @@
+{
+    "history_retention_days": 7,
+    "sources": [
+        {
+            "id": "rust",
+            "name": "Rust Ecosystem",
+            "url": "https://dev.to/feed/tag/rust",
+            "type": "rss",
+            "max_items": 5,
+            "schedule_strategy": {
+                "mode": "random_range",
+                "start_hour": 1,
+                "end_hour": 5
+            }
+        },
+        {
+            "id": "flutter",
+            "name": "Flutter & Cross-Platform",
+            "url": "https://dev.to/feed/tag/flutter",
+            "type": "rss",
+            "max_items": 5,
+            "schedule_strategy": {
+                "mode": "random_range",
+                "start_hour": 5,
+                "end_hour": 9
+            }
+        },
+        {
+            "id": "techcrunch",
+            "name": "Global Tech Crunch",
+            "url": "https://techcrunch.com/feed/",
+            "type": "rss",
+            "max_items": 5,
+            "schedule_strategy": {
+                "mode": "fixed_hour",
+                "hour": 6
+            }
+        }
+    ]
+}
