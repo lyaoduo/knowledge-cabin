@@ -17,14 +17,20 @@ pip install requests beautifulsoup4 lxml feedparser
 在当前目录下直接运行主程序：
 
 ```bash
-python main.py
+python main.py --force-run
 ```
 
 ### 3. 查看本地渲染结果
 
-运行完成后，你会在当前目录下看见两个新生成的文件：
+运行完成后，你会在当前目录下看见这些新生成的内容：
 
 - `data_store.json`：本地的 7 天数据滚动缓冲池。
-- `index.html`：本地完美渲染出来的分类科技知识看板。
+- `index.html`：带缩略图的分类科技知识看板。
+- `articles/`：最近 7 天文章的本地正文页面。
+- `media/`：正文页和列表缩略图使用的本地图片缓存。
 
 直接双击 `index.html`，即可在本地电脑浏览器上直接预览最终部署到服务器上的网页效果。
+
+## 🚀 服务器部署指南
+
+参考: [deploy.md](deploy.md)
