@@ -16,6 +16,7 @@ from renderer import render_html
 
 FETCHED_AT_FORMAT = "%Y-%m-%d %H:%M"
 DEFAULT_OUTPUT_PATH = "/var/www/html/index.html"
+OUTPUT_PATH_ENV = "KNOWLEDGE_CABIN_OUTPUT_PATH"
 LOCAL_MEDIA_DIR = "media"
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -212,6 +213,11 @@ def is_safe_url(value):
 
 def is_remote_url(value):
     return urlparse(value or "").scheme in {"http", "https"}
+
+
+def configured_output_path():
+    candidate = (os.getenv(OUTPUT_PATH_ENV) or "").strip()
+    return candidate or DEFAULT_OUTPUT_PATH
 
 
 def resolve_output_dir(output_path=DEFAULT_OUTPUT_PATH):
@@ -852,7 +858,8 @@ def main(force_run=False):
     store.setdefault("articles", [])
 
     retention_days = config.get("history_retention_days", 7)
-    output_dir = resolve_output_dir()
+    output_path = configured_output_path()
+    output_dir = resolve_output_dir(output_path)
     changed = False
 
     for article in store["articles"]:
@@ -899,7 +906,7 @@ def main(force_run=False):
         save_store(store)
 
     categories = group_categories(config, store["articles"])
-    render_html(categories, retention_days=retention_days)
+    render_html(categories, output_path=output_path, retention_days=retention_days)
 
 
 if __name__ == "__main__":
