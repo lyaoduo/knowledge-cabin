@@ -34,3 +34,104 @@ python main.py --force-run
 ## 🚀 服务器部署指南
 
 参考: [deploy.md](deploy.md)
+
+## 服务器排查注意事项
+
+### 1. 页面没更新时先看发布链路
+
+`Updated` 显示的是 `index.html` 被重新渲染的时间。如果定时任务执行了，但网页上的 `Updated` 仍然停在旧时间，通常说明任务没有成功写入或发布到 Nginx 目录。
+
+先手动强制运行一次：
+
+```bash
+~/knowledge-cabin/run_knowledge_cabin.sh --force-run
+```
+
+成功时应看到类似：
+
+```text
+HTML rendered successfully to: /home/ubuntu/knowledge-cabin/.site/index.html
+Article pages rendered: 56; stale pages removed: 0
+已通过 sudo 同步静态文件到: /var/www/html
+```
+
+再对比 staging 和线上文件：
+
+```bash
+grep -n "Updated" ~/knowledge-cabin/.site/index.html /var/www/html/index.html
+curl -s http://127.0.0.1/ | grep -A6 "Updated"
+```
+
+### 2. 避免用 root 运行主程序
+
+主程序会写 `data_store.json`、`articles/`、`media/` 和 `.site/`。如果曾经用 `sudo python main.py` 或 root 身份运行过，可能导致这些文件属于 root，之后 cron 以 `ubuntu` 用户运行时会报：
+
+```text
+PermissionError: [Errno 13] Permission denied: 'data_store.json'
+```
+
+修复：
+
+```bash
+sudo chown -R ubuntu:ubuntu /home/ubuntu/knowledge-cabin
+chmod -R u+rwX /home/ubuntu/knowledge-cabin
+```
+
+然后重新执行：
+
+```bash
+~/knowledge-cabin/run_knowledge_cabin.sh --force-run
+```
+
+### 3. `sudo -i` 不问密码不等于 cron 一定能 sudo
+
+终端里执行 `sudo -i` 不问密码，可能只是 sudo 凭据缓存。脚本使用的是非交互式 sudo：
+
+```bash
+sudo -n true
+```
+
+检查真实免密 sudo：
+
+```bash
+sudo -k
+sudo -n true
+echo $?
+sudo -l
+```
+
+如果 `sudo -l` 里有：
+
+```text
+(ALL) NOPASSWD: ALL
+```
+
+说明当前用户可以免密 sudo，发布到 `/var/www/html` 理论上可行。
+
+### 4. 给 cron 留日志
+
+不要长期把定时任务输出全部丢掉，否则权限错误会被吞掉。推荐把 crontab 改成：
+
+```cron
+0 * * * * /home/ubuntu/knowledge-cabin/run_knowledge_cabin.sh >> /home/ubuntu/knowledge-cabin/cron.log 2>&1
+```
+
+查看最近错误：
+
+```bash
+tail -100 ~/knowledge-cabin/cron.log
+```
+
+### 5. `/var/www/html` 下的额外目录可能被删除
+
+部署脚本会把 `.site/` 镜像同步到 `/var/www/html/`：
+
+```bash
+sudo -n rsync -a --delete "$SITE_BUILD_DIR/" "$PUBLISH_DIR/"
+```
+
+`--delete` 会删除 `/var/www/html/` 中不存在于 `.site/` 的额外文件或目录。不要把其它页面直接放在 `/var/www/html/sub` 这类目录里，除非你修改同步策略。可选方案：
+
+- 把其它页面放到独立 Nginx root，例如 `/srv/www/sub`，用单独域名访问。
+- 把本项目发布到 `/var/www/html/blog`，让 `/var/www/html/sub` 不再位于本项目同步根目录。
+- 在 `rsync` 中加入排除规则，例如 `--exclude 'sub/'`。
