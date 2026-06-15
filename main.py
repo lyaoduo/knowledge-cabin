@@ -10,6 +10,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
 
 from renderer import render_html
 
@@ -31,6 +32,21 @@ IMAGE_EXTENSIONS = {
     "image/gif": ".gif",
     "image/svg+xml": ".svg",
 }
+
+
+class FetchClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(REQUEST_HEADERS)
+        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, pool_block=True)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+    def get(self, url, timeout, **kwargs):
+        return self.session.get(url, timeout=timeout, **kwargs)
+
+    def close(self):
+        self.session.close()
 
 DROP_TAGS = {
     "script",
@@ -215,6 +231,20 @@ def is_remote_url(value):
     return urlparse(value or "").scheme in {"http", "https"}
 
 
+def is_local_media_ref(value):
+    return (value or "").strip().replace("\\", "/").startswith(f"{LOCAL_MEDIA_DIR}/")
+
+
+def article_needs_media_work(article):
+    thumbnail = article.get("thumbnail", "").strip()
+    thumbnail_local = article.get("thumbnail_local", "").strip()
+    if thumbnail and not is_local_media_ref(thumbnail_local):
+        return True
+
+    content_html = article.get("content_html") or ""
+    return "<img" in content_html and ("http://" in content_html or "https://" in content_html)
+
+
 def configured_output_path():
     candidate = (os.getenv(OUTPUT_PATH_ENV) or "").strip()
     return candidate or DEFAULT_OUTPUT_PATH
@@ -349,7 +379,7 @@ def existing_local_image(output_dir, article_id, digest):
     return ""
 
 
-def download_image(src, article_id, output_dir):
+def download_image(src, article_id, output_dir, fetch_client):
     if not is_remote_url(src):
         return src
 
@@ -358,8 +388,9 @@ def download_image(src, article_id, output_dir):
     if existing:
         return existing
 
+    tmp_path = ""
     try:
-        res = requests.get(src, headers=REQUEST_HEADERS, timeout=25)
+        res = fetch_client.get(src, timeout=25, stream=True)
         if res.status_code != 200:
             log(f"Skip image download ({res.status_code}): {src}")
             return src
@@ -373,30 +404,48 @@ def download_image(src, article_id, output_dir):
         ref = local_media_ref(article_id, filename)
         path = media_path(output_dir, ref)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(res.content)
+        tmp_path = f"{path}.part"
+        with open(tmp_path, "wb") as f:
+            for chunk in res.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    f.write(chunk)
+        os.replace(tmp_path, path)
         return ref
     except Exception as e:
         log(f"Error downloading image {src}: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
         return src
+    finally:
+        if "res" in locals():
+            res.close()
 
 
-def localize_content_images(article, output_dir):
+def localize_content_images(article, output_dir, fetch_client):
     content_html = article.get("content_html") or ""
     if "<img" not in content_html:
-        soup = BeautifulSoup(content_html, "html.parser")
-        changed = cleanup_empty_image_wrappers(soup)
-        if changed:
-            article["content_html"] = "".join(str(child) for child in soup.contents).strip()
-        return changed
+        return False
 
     soup = BeautifulSoup(content_html, "html.parser")
+    thumbnail_key = image_identity(article.get("thumbnail"))
+    seen = set()
     changed = False
     image_refs = {}
-    for img in soup.find_all("img"):
+    for img in list(soup.find_all("img")):
         src = img.get("src", "").strip()
-        local_src = download_image(src, article["id"], output_dir)
-        image_refs[image_identity(src)] = local_src
+        key = image_identity(src)
+        if not key:
+            remove_image_node(img)
+            changed = True
+            continue
+        if key in seen or (thumbnail_key and key == thumbnail_key):
+            remove_image_node(img)
+            changed = True
+            continue
+
+        seen.add(key)
+        local_src = download_image(src, article["id"], output_dir, fetch_client)
+        image_refs[key] = local_src
         if local_src != src:
             img["src"] = local_src
             changed = True
@@ -426,18 +475,16 @@ def localize_content_images(article, output_dir):
     return changed
 
 
-def localize_article_images(article, output_dir):
-    changed = dedupe_content_images(article)
-
+def localize_article_images(article, output_dir, fetch_client):
+    changed = False
     thumbnail = article.get("thumbnail", "").strip()
     if thumbnail:
-        local_thumbnail = download_image(thumbnail, article["id"], output_dir)
+        local_thumbnail = download_image(thumbnail, article["id"], output_dir, fetch_client)
         if local_thumbnail != article.get("thumbnail_local"):
             article["thumbnail_local"] = local_thumbnail
             changed = True
 
-    changed = localize_content_images(article, output_dir) or changed
-    changed = dedupe_content_images(article) or changed
+    changed = localize_content_images(article, output_dir, fetch_client) or changed
     return changed
 
 
@@ -459,7 +506,7 @@ def cleanup_stale_media(output_dir, articles):
         os.rmdir(path)
 
 
-def sanitize_html_fragment(raw_html, base_url=""):
+def sanitize_html_fragment_with_text(raw_html, base_url=""):
     soup = BeautifulSoup(raw_html or "", "html.parser")
 
     for tag in list(soup.find_all(True)):
@@ -506,8 +553,14 @@ def sanitize_html_fragment(raw_html, base_url=""):
             else:
                 tag.decompose()
 
-    cleaned = "".join(str(child) for child in soup.contents).strip()
-    return cleaned
+    cleaned_text = " ".join(soup.get_text(" ", strip=True).split())
+    cleaned_html = "".join(str(child) for child in soup.contents).strip()
+    return cleaned_html, cleaned_text
+
+
+def sanitize_html_fragment(raw_html, base_url=""):
+    cleaned_html, _ = sanitize_html_fragment_with_text(raw_html, base_url)
+    return cleaned_html
 
 
 def first_image_from_html(raw_html, base_url=""):
@@ -571,8 +624,10 @@ def content_from_entry(entry):
 
 
 def build_article(source_config, title, link, excerpt="", thumbnail="", published_at="", raw_content=""):
-    content_html = sanitize_html_fragment(raw_content, link) if raw_content else ""
-    content_text = strip_html_text(content_html)
+    if raw_content:
+        content_html, content_text = sanitize_html_fragment_with_text(raw_content, link)
+    else:
+        content_html, content_text = "", ""
     if not excerpt:
         excerpt = truncate_text(content_text)
 
@@ -592,10 +647,10 @@ def build_article(source_config, title, link, excerpt="", thumbnail="", publishe
     }
 
 
-def parse_devto(source_config):
+def parse_devto(source_config, fetch_client):
     articles = []
     try:
-        res = requests.get(source_config["url"], headers=REQUEST_HEADERS, timeout=15)
+        res = fetch_client.get(source_config["url"], timeout=15)
         if res.status_code != 200:
             return articles
         soup = BeautifulSoup(res.text, "html.parser")
@@ -612,13 +667,16 @@ def parse_devto(source_config):
             articles.append(build_article(source_config, title, link, excerpt))
     except Exception as e:
         log(f"Error crawling {source_config['name']}: {e}")
+    finally:
+        if "res" in locals():
+            res.close()
     return articles
 
 
-def parse_techcrunch(source_config):
+def parse_techcrunch(source_config, fetch_client):
     articles = []
     try:
-        res = requests.get(source_config["url"], headers=REQUEST_HEADERS, timeout=15)
+        res = fetch_client.get(source_config["url"], timeout=15)
         if res.status_code != 200:
             return articles
         soup = BeautifulSoup(res.text, "html.parser")
@@ -639,13 +697,19 @@ def parse_techcrunch(source_config):
             articles.append(build_article(source_config, title, link, excerpt, thumbnail))
     except Exception as e:
         log(f"Error crawling {source_config['name']}: {e}")
+    finally:
+        if "res" in locals():
+            res.close()
     return articles
 
 
-def parse_universal_rss(source_config):
+def parse_universal_rss(source_config, fetch_client):
     articles = []
     try:
-        feed = feedparser.parse(source_config["url"])
+        res = fetch_client.get(source_config["url"], timeout=15)
+        if res.status_code != 200:
+            return articles
+        feed = feedparser.parse(res.content)
         items = feed.entries[: source_config["max_items"]]
 
         for item in items:
@@ -671,6 +735,9 @@ def parse_universal_rss(source_config):
             )
     except Exception as e:
         log(f"Error parsing RSS for {source_config['name']}: {e}")
+    finally:
+        if "res" in locals():
+            res.close()
     return articles
 
 
@@ -714,13 +781,13 @@ def select_content_node(soup, link):
     return best
 
 
-def fetch_article_details(article):
+def fetch_article_details(article, fetch_client):
     link = article.get("link", "")
     if not link or link == "#":
         return {}
 
     try:
-        res = requests.get(link, headers=REQUEST_HEADERS, timeout=20)
+        res = fetch_client.get(link, timeout=20)
         if res.status_code != 200:
             return {}
         soup = BeautifulSoup(res.text, "html.parser")
@@ -730,8 +797,7 @@ def fetch_article_details(article):
             return {"thumbnail": thumbnail}
 
         raw_content = "".join(str(child) for child in content_node.contents)
-        content_html = sanitize_html_fragment(raw_content, link)
-        content_text = strip_html_text(content_html)
+        content_html, content_text = sanitize_html_fragment_with_text(raw_content, link)
         if not thumbnail:
             thumbnail = first_image_from_html(content_html, link)
         return {
@@ -741,6 +807,9 @@ def fetch_article_details(article):
         }
     except Exception as e:
         log(f"Error fetching body for {article.get('title', link)}: {e}")
+    finally:
+        if "res" in locals():
+            res.close()
     return {}
 
 
@@ -749,7 +818,7 @@ def fallback_content(article):
     return f"<p>{escape(excerpt_text)}</p>"
 
 
-def ensure_article_details(article):
+def ensure_article_details(article, fetch_client):
     changed = False
     needs_content = article.get("content_status") != "full"
     needs_thumbnail = not article.get("thumbnail")
@@ -757,7 +826,7 @@ def ensure_article_details(article):
     if not needs_content and not needs_thumbnail:
         return False
 
-    details = fetch_article_details(article)
+    details = fetch_article_details(article, fetch_client)
     if details.get("thumbnail") and details["thumbnail"] != article.get("thumbnail"):
         article["thumbnail"] = details["thumbnail"]
         changed = True
@@ -861,44 +930,57 @@ def main(force_run=False):
     output_path = configured_output_path()
     output_dir = resolve_output_dir(output_path)
     changed = False
+    dirty_article_ids = set()
+    fetch_client = FetchClient()
 
-    for article in store["articles"]:
-        changed = normalize_article(article) or changed
-    changed = prune_articles(store, retention_days) or changed
+    try:
+        for article in store["articles"]:
+            changed = normalize_article(article) or changed
+        changed = prune_articles(store, retention_days) or changed
 
-    existing_by_link = {article["link"]: article for article in store["articles"] if article.get("link")}
+        existing_by_link = {article["link"]: article for article in store["articles"] if article.get("link")}
 
-    for source in config["sources"]:
-        if force_run or should_run_now(source["schedule_strategy"], source["id"], store):
-            print(f"[{datetime.now().strftime('%H:%M')}] Running task for: {source['name']}")
+        for source in config["sources"]:
+            if force_run or should_run_now(source["schedule_strategy"], source["id"], store):
+                print(f"[{datetime.now().strftime('%H:%M')}] Running task for: {source['name']}")
 
-            if source["type"] == "devto":
-                fetched = parse_devto(source)
-            elif source["type"] == "techcrunch":
-                fetched = parse_techcrunch(source)
-            elif source["type"] == "rss":
-                fetched = parse_universal_rss(source)
-            else:
-                log(f"Unknown source type for {source['name']}, skipping.")
-                continue
-
-            for item in fetched:
-                existing = existing_by_link.get(item["link"])
-                if existing:
-                    changed = merge_article(existing, item) or changed
+                if source["type"] == "devto":
+                    fetched = parse_devto(source, fetch_client)
+                elif source["type"] == "techcrunch":
+                    fetched = parse_techcrunch(source, fetch_client)
+                elif source["type"] == "rss":
+                    fetched = parse_universal_rss(source, fetch_client)
                 else:
-                    store["articles"].append(item)
-                    existing_by_link[item["link"]] = item
+                    log(f"Unknown source type for {source['name']}, skipping.")
+                    continue
+
+                for item in fetched:
+                    existing = existing_by_link.get(item["link"])
+                    if existing:
+                        if merge_article(existing, item):
+                            dirty_article_ids.add(existing["id"])
+                            changed = True
+                    else:
+                        store["articles"].append(item)
+                        existing_by_link[item["link"]] = item
+                        dirty_article_ids.add(item["id"])
+                        changed = True
+            else:
+                print(f"[{datetime.now().strftime('%H:%M')}] Skip {source['name']} (Strategy hour not reached)")
+
+        changed = prune_articles(store, retention_days) or changed
+        store["articles"].sort(key=article_sort_time, reverse=True)
+
+        for article in store["articles"]:
+            if ensure_article_details(article, fetch_client):
+                dirty_article_ids.add(article["id"])
+                changed = True
+
+            if article["id"] in dirty_article_ids or article_needs_media_work(article):
+                if localize_article_images(article, output_dir, fetch_client):
                     changed = True
-        else:
-            print(f"[{datetime.now().strftime('%H:%M')}] Skip {source['name']} (Strategy hour not reached)")
-
-    changed = prune_articles(store, retention_days) or changed
-    store["articles"].sort(key=article_sort_time, reverse=True)
-
-    for article in store["articles"]:
-        changed = ensure_article_details(article) or changed
-        changed = localize_article_images(article, output_dir) or changed
+    finally:
+        fetch_client.close()
 
     cleanup_stale_media(output_dir, store["articles"])
 

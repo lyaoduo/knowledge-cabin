@@ -118,7 +118,8 @@ def render_list_item(article):
 """
 
 
-def render_article_page(article):
+def render_article_page(article, css=None):
+    css = site_css() if css is None else css
     title = escape_html(article.get("title"))
     category = escape_html(article.get("category_name"))
     fetched_at = escape_html(article.get("fetched_at"))
@@ -144,7 +145,7 @@ def render_article_page(article):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{title} | {SITE_NAME}</title>
-    <style>{site_css()}</style>
+    <style>{css}</style>
 </head>
 <body>
     <header class="site-header">
@@ -176,10 +177,10 @@ def render_article_page(article):
 </html>"""
 
 
-def render_index(categories, retention_days):
+def iter_index_chunks(categories, retention_days, css):
     nav_html = ""
-    sections_html = ""
     total_articles = sum(len(cat["articles"]) for cat in categories.values())
+    has_sections = False
 
     for cat_id, cat_data in categories.items():
         articles = cat_data["articles"]
@@ -187,39 +188,17 @@ def render_index(categories, retention_days):
             continue
 
         nav_html += f'<a href="#{escape_html(cat_id)}">{escape_html(cat_data["name"])}</a>'
-        list_html = "".join(render_list_item(article) for article in articles)
-        sections_html += f"""
-        <section class="category-block" id="{escape_html(cat_id)}">
-            <div class="section-heading">
-                <div>
-                    <p>{escape_html(cat_data["name"])}</p>
-                    <h2>{len(articles)} recent notes</h2>
-                </div>
-                <a href="#top">Back to top</a>
-            </div>
-            <div class="posts-list">
-                {list_html}
-            </div>
-        </section>
-"""
-
-    if not sections_html:
-        sections_html = """
-        <section class="empty-state">
-            <h2>No recent notes</h2>
-            <p>This page will update after the next sync.</p>
-        </section>
-"""
+        has_sections = True
 
     updated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    return f"""<!DOCTYPE html>
+    yield f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{SITE_NAME}</title>
-    <style>{site_css()}</style>
+    <style>{css}</style>
 </head>
 <body id="top">
     <header class="site-header">
@@ -252,7 +231,39 @@ def render_index(categories, retention_days):
                 </div>
             </dl>
         </section>
-        {sections_html}
+"""
+
+    if not has_sections:
+        yield """
+        <section class="empty-state">
+            <h2>No recent notes</h2>
+            <p>This page will update after the next sync.</p>
+        </section>
+"""
+    else:
+        for cat_id, cat_data in categories.items():
+            articles = cat_data["articles"]
+            if not articles:
+                continue
+            yield f"""
+        <section class="category-block" id="{escape_html(cat_id)}">
+            <div class="section-heading">
+                <div>
+                    <p>{escape_html(cat_data["name"])}</p>
+                    <h2>{len(articles)} recent notes</h2>
+                </div>
+                <a href="#top">Back to top</a>
+            </div>
+            <div class="posts-list">
+"""
+            for article in articles:
+                yield render_list_item(article)
+            yield """
+            </div>
+        </section>
+"""
+
+    yield f"""
     </main>
 
     <footer class="site-footer">
@@ -260,6 +271,11 @@ def render_index(categories, retention_days):
     </footer>
 </body>
 </html>"""
+
+
+def render_index(categories, retention_days, css=None):
+    css = site_css() if css is None else css
+    return "".join(iter_index_chunks(categories, retention_days, css))
 
 
 def site_css():
@@ -740,6 +756,12 @@ def write_file(path, content):
         f.write(content)
 
 
+def write_chunks(path, chunks):
+    with open(path, "w", encoding="utf-8") as f:
+        for chunk in chunks:
+            f.write(chunk)
+
+
 def cleanup_article_pages(articles_dir, active_files):
     if not os.path.isdir(articles_dir):
         return 0
@@ -757,15 +779,16 @@ def render_html(categories, output_path="/var/www/html/index.html", retention_da
     output_path, output_dir = output_location(output_path)
     articles_dir = os.path.join(output_dir, "articles")
     os.makedirs(articles_dir, exist_ok=True)
+    css = site_css()
 
     active_files = set()
     for category in categories.values():
         for article in category["articles"]:
             filename = article_filename(article)
             active_files.add(filename)
-            write_file(os.path.join(articles_dir, filename), render_article_page(article))
+            write_file(os.path.join(articles_dir, filename), render_article_page(article, css))
 
     removed = cleanup_article_pages(articles_dir, active_files)
-    write_file(output_path, render_index(categories, retention_days))
+    write_chunks(output_path, iter_index_chunks(categories, retention_days, css))
     print(f"HTML rendered successfully to: {output_path}")
     print(f"Article pages rendered: {len(active_files)}; stale pages removed: {removed}")
